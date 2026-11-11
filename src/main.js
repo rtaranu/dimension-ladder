@@ -152,6 +152,19 @@ class Fill {
 }
 
 const GLASS_N = 4; // each pane is drawn as a 4x4 grid so perspective shadows stay exact
+// How hazy one pane is: the fraction of the way to its full tint that it pushes whatever is
+// behind it. Panes combine as 1 - (1 - haze)^n, the way real layers of frosted glass do: two
+// panes are nearly twice as hazy as one, and a deep stack approaches the full tint without
+// ever blowing out. The result does not depend on the order the panes are drawn in.
+const HAZE_PER_PANE = 0.3;
+const HAZE_BLEND = {
+  blending: THREE.CustomBlending,
+  blendEquation: THREE.AddEquation,
+  blendSrc: THREE.OneMinusDstColorFactor,
+  blendDst: THREE.OneFactor,
+  blendSrcAlpha: THREE.ZeroFactor,
+  blendDstAlpha: THREE.OneFactor,
+};
 
 /**
  * Edge-lit glass. Each pane glows the colour of the edge it meets along that border and thins
@@ -183,17 +196,15 @@ const glassMaterial = new THREE.ShaderMaterial({
     void main() {
       float nearU = 1.0 - min(vUv.x, 1.0 - vUv.x) * 2.0; // 1 on the borders that run along axis B
       float nearV = 1.0 - min(vUv.y, 1.0 - vUv.y) * 2.0; // 1 on the borders that run along axis A
-      float len = length(vN);
-      float facing = len > 1e-6 ? abs(dot(vN / len, normalize(vP))) : 1.0;
-      float rim = pow(1.0 - facing, 2.0); // glass seen edge-on catches more light
-      vec3 body = (vA + vB) * 0.5;
-      vec3 col = body * (0.085 + 0.3 * rim)
-               + vA * pow(nearV, 5.0) * 0.42
-               + vB * pow(nearU, 5.0) * 0.42;
-      gl_FragColor = vec4(col, 1.0);
-      #include <colorspace_fragment>
+      // Only the tint drifts towards the nearest edge's colour; the amount of haze is the same
+      // everywhere on every pane, from every angle.
+      float towardsB = clamp(0.5 + 0.5 * (pow(nearU, 3.0) - pow(nearV, 3.0)), 0.0, 1.0);
+      vec3 tint = mix(vA, vB, towardsB);
+      // Written straight to the screen with no colour-space curve, so every pane is exactly
+      // the same strength wherever it sits in the stack.
+      gl_FragColor = vec4(tint * ${HAZE_PER_PANE.toFixed(3)}, 1.0);
     }`,
-  blending: THREE.AdditiveBlending,
+  ...HAZE_BLEND,
   transparent: true,
   depthWrite: false,
   side: THREE.DoubleSide,
@@ -209,7 +220,9 @@ class Glass {
     const colorA = new Float32Array(total * 3), colorB = new Float32Array(total * 3);
     let k = 0;
     for (const face of shape.faces) {
-      const A = AXIS_COLORS[face.axes[0]], B = AXIS_COLORS[face.axes[1]];
+      // Screen-space colour values, because the glass shader skips the colour-space curve.
+      const A = AXIS_COLORS[face.axes[0]].clone().convertLinearToSRGB();
+      const B = AXIS_COLORS[face.axes[1]].clone().convertLinearToSRGB();
       for (let t = 0; t < N; t++) for (let s = 0; s < N; s++) {
         for (const [ds, dt] of [[0, 0], [1, 0], [1, 1], [0, 0], [1, 1], [0, 1]]) {
           uvs[k * 2] = (s + ds) / N; uvs[k * 2 + 1] = (t + dt) / N;
@@ -473,8 +486,10 @@ class Station {
     } else {
       // On a line the pane's shadow is just the stretch it covers, so draw that as a band.
       this.band = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), new THREE.MeshBasicMaterial({
-        color: _mix.copy(AXIS_COLORS[0]).lerp(AXIS_COLORS[1], 0.5).clone(),
-        transparent: true, opacity: 0.22, blending: THREE.AdditiveBlending, depthWrite: false,
+        color: _mix.copy(AXIS_COLORS[0]).convertLinearToSRGB()
+          .lerp(AXIS_COLORS[1].clone().convertLinearToSRGB(), 0.5)
+          .multiplyScalar(HAZE_PER_PANE).convertSRGBToLinear().clone(),
+        transparent: true, ...HAZE_BLEND, depthWrite: false,
       }));
       this.band.position.z = -0.006;
       this.view.add(this.band);
