@@ -9,7 +9,7 @@ import {
 
 // Shown on the page and in the headset, so it is obvious which version is running.
 // Bump this (and the ?v= above when math4d.js changes) with every release.
-const BUILD = 'build 6';
+const BUILD = 'build 7';
 
 // ---------------------------------------------------------------- constants
 
@@ -493,6 +493,16 @@ class Station {
     this.view = new THREE.Group();
     this.view.position.set(0, viewY, 0);
     this.group.add(this.view);
+    this.viewHome = this.view.position.clone();
+    if (dim === 4) {
+      // What we see of a 4D object is a real 3D thing, so it can be picked up and turned over.
+      const grabHit = new THREE.Mesh(
+        new THREE.SphereGeometry(0.27, 16, 12),
+        new THREE.MeshBasicMaterial({ transparent: true, opacity: 0, depthWrite: false }));
+      grabHit.userData = { kind: 'object', station: this };
+      this.view.add(grabHit);
+      interactables.push(grabHit);
+    }
     if (dim < 4) {
       const backing = new THREE.Mesh(
         new THREE.PlaneGeometry(0.44, dim === 2 ? 0.09 : 0.32),
@@ -519,6 +529,14 @@ class Station {
     const klabel = makeLabel([knobsName], { height: 0.03, color: AXIS_CSS[hidden] });
     klabel.position.set(0, 0.775, 0.16);
     this.group.add(klabel);
+  }
+
+  /** Put the view back on its stand, the right way up and at its normal size. */
+  resetView() {
+    if (this.view.parent !== this.group) this.group.add(this.view);
+    this.view.position.copy(this.viewHome);
+    this.view.quaternion.identity();
+    this.view.scale.setScalar(1);
   }
 
   /** Add a per-shape drawable, remembered so it can be thrown away on the next shape change. */
@@ -895,6 +913,10 @@ function resetAll() {
   setPassing(false);
   state.push = 0;
   setUnfold(0);
+  for (const c of xrControllers) {
+    if (c.userData.grab?.object || c.userData.grab?.scale) c.userData.grab = null;
+  }
+  for (const s of stations) s.resetView();
 }
 setFamily(0);
 setMode(0);
@@ -918,6 +940,14 @@ function pick(event) {
   return hit ? hit.object.userData : null;
 }
 
+const _axis = new THREE.Vector3(), _pq = new THREE.Quaternion(), _turn = new THREE.Quaternion();
+
+/** Turn an object about an axis given in world space, whatever its parent's orientation. */
+function turnInWorld(object, worldAxis, angle) {
+  object.parent.getWorldQuaternion(_pq).invert();
+  object.quaternion.premultiply(_turn.setFromAxisAngle(worldAxis.applyQuaternion(_pq).normalize(), angle));
+}
+
 /** Move the slider to wherever the current ray (mouse or controller) crosses its track. */
 function sliderFromRay() {
   const hit = raycaster.intersectObject(sliderHit, false)[0];
@@ -931,6 +961,8 @@ renderer.domElement.addEventListener('pointerdown', (event) => {
   if (target.kind === 'slider') {
     drag = { slider: true };
     sliderFromRay();
+  } else if (target.kind === 'object') {
+    drag = { object: target.station, x: event.clientX, y: event.clientY };
   } else {
     drag = { knob: target.knob, x: event.clientX };
     drag.knob.grabbed = true;
@@ -942,6 +974,15 @@ renderer.domElement.addEventListener('pointermove', (event) => {
   if (drag?.slider) {
     pick(event);
     sliderFromRay();
+    return;
+  }
+  if (drag?.object) {
+    // Dragging turns the object about the screen's up and sideways directions.
+    const view = drag.object.view;
+    turnInWorld(view, _axis.set(0, 1, 0), (event.clientX - drag.x) * 0.01);
+    turnInWorld(view, _axis.set(1, 0, 0).applyQuaternion(camera.quaternion), (event.clientY - drag.y) * 0.01);
+    drag.x = event.clientX;
+    drag.y = event.clientY;
     return;
   }
   if (drag) {
@@ -1009,6 +1050,19 @@ function onPress(c, kind) {
   if (c.userData.grab) return;
   if (target.kind === 'slider') {
     c.userData.grab = { slider: true, kind };
+  } else if (target.kind === 'object') {
+    const station = target.station, view = station.view;
+    const holder = xrControllers.find((o) => o !== c && o.userData.grab?.object === station);
+    if (holder) {
+      // A second hand on an object already held stretches or shrinks it.
+      c.userData.grab = {
+        scale: station, kind, other: holder,
+        startDistance: Math.max(0.02, c.position.distanceTo(holder.position)), startScale: view.scale.x,
+      };
+    } else {
+      c.attach(view); // from now on it moves and turns with the hand, exactly as held
+      c.userData.grab = { object: station, kind };
+    }
   } else {
     c.userData.grab = { knob: target.knob, kind, prev: c.quaternion.clone(), turned: 0 };
     target.knob.grabbed = true;
@@ -1020,6 +1074,11 @@ function onRelease(c, kind) {
   const grab = c.userData.grab;
   if (!grab || grab.kind !== kind) return;
   if (grab.knob) grab.knob.grabbed = false;
+  if (grab.object) {
+    // Let go: it stays floating wherever it was left, until Reset puts it back.
+    grab.object.group.attach(grab.object.view);
+    for (const o of xrControllers) if (o.userData.grab?.scale === grab.object) o.userData.grab = null;
+  }
   c.userData.grab = null;
 }
 
@@ -1072,6 +1131,17 @@ function updateControllers(dt) {
 
     if (data.grab?.slider) {
       sliderFromRay(); // the raycaster is still aimed along this controller
+    } else if (data.grab?.object) {
+      // While holding the object, the thumbstick reels it in towards the hand or out again.
+      const reel = data.source?.gamepad?.axes?.[3] ?? 0;
+      if (Math.abs(reel) > 0.2) {
+        const view = data.grab.object.view;
+        view.position.z = Math.min(-0.05, view.position.z + reel * dt * 0.9);
+      }
+    } else if (data.grab?.scale) {
+      const g = data.grab, view = g.scale.view;
+      const ratio = c.position.distanceTo(g.other.position) / g.startDistance;
+      view.scale.setScalar(Math.min(5, Math.max(0.3, g.startScale * ratio)));
     } else if (data.grab) {
       // Twisting the wrist while holding trigger or grip turns the knob by the same amount.
       _dq.copy(data.grab.prev).invert().multiply(c.quaternion);
