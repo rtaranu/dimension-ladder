@@ -28,6 +28,11 @@
     Drag a knob to turn it · drag elsewhere to look around<br>
     M: change view · Space: auto-spin · R: reset knobs
   </div>
-  <script type="module" src="./src/main.js"></script>
+  <!-- A fresh address on every load, so the browser never reuses a stale copy of the app. -->
+  <script type="module">
+    const stamp = Date.now();
+    window.__stamp = stamp;
+    import(`./src/main.js?t=${stamp}`);
+  </script>
 </body>
 </html>

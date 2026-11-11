@@ -2,7 +2,11 @@ import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { VRButton } from 'three/addons/webxr/VRButton.js';
 import { XRControllerModelFactory } from 'three/addons/webxr/XRControllerModelFactory.js';
-import { makeBox, rotate, project, sliceCrossings, sliceSegments, sliceFacets, orderPlanar } from './math4d.js';
+import { makeBox, rotate, project, sliceCrossings, sliceSegments, sliceFacets, orderPlanar } from './math4d.js?v=4';
+
+// Shown on the page and in the headset, so it is obvious which version is running.
+// Bump this (and the ?v= above when math4d.js changes) with every release.
+const BUILD = 'build 4';
 
 // ---------------------------------------------------------------- constants
 
@@ -661,6 +665,11 @@ function setAutoSpin(on) {
   state.autoSpin = on;
   spinButton.label.setText([`Auto-spin: ${on ? 'on' : 'off'}`]);
 }
+const buildTag = makeLabel([BUILD], { height: 0.026, color: '#8f9bb3', weight: 500 });
+buildTag.position.set(0, -0.075, 0);
+panel.add(buildTag);
+document.getElementById('hint')?.append(` · ${BUILD}`);
+
 /** Square everything up and stop, so one knob can be explored at a time. */
 function resetKnobs() {
   for (const k of knobs) k.angle = 0;
