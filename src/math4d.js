@@ -19,7 +19,19 @@ export function makeBox(halfExtents) {
       if (!((i >> a) & 1)) edges.push({ a: i, b: i | (1 << a), axis: a });
     }
   }
-  return { dim: n, vertices, edges };
+  // A 2D face spans two axes. Corners are listed going round the face: u runs along axes[0],
+  // v along axes[1]. A rectangle has 1, a cube 6, a tesseract 24.
+  const faces = [];
+  for (let p = 0; p < n; p++) {
+    for (let q = p + 1; q < n; q++) {
+      const P = 1 << p, Q = 1 << q;
+      for (let i = 0; i < count; i++) {
+        if (i & (P | Q)) continue;
+        faces.push({ corners: [i, i | P, i | P | Q, i | Q], axes: [p, q] });
+      }
+    }
+  }
+  return { dim: n, vertices, edges, faces };
 }
 
 /** Rotate every point by `angle` in the plane spanned by axes p and q (turning p towards q). */

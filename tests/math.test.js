@@ -18,6 +18,22 @@ test('vertex and edge counts', () => {
   eq(tess.vertices.length, 16); eq(tess.edges.length, 32);
 });
 
+test('face counts: 1, 6, 24, with 4 tesseract faces per axis pair', () => {
+  eq(rect.faces.length, 1); eq(cube.faces.length, 6); eq(tess.faces.length, 24);
+  for (let p = 0; p < 4; p++) for (let q = p + 1; q < 4; q++) {
+    eq(tess.faces.filter((f) => f.axes[0] === p && f.axes[1] === q).length, 4, `pair ${p}${q}`);
+  }
+});
+
+test('face corners go round the face along its two axes', () => {
+  for (const f of tess.faces) {
+    const c = f.corners.map((i) => tess.vertices[i]);
+    const diff = (a, b) => a.map((x, k) => x - b[k]).findIndex((d) => d !== 0);
+    eq(diff(c[1], c[0]), f.axes[0]); eq(diff(c[3], c[0]), f.axes[1]);
+    eq(diff(c[2], c[1]), f.axes[1]); eq(diff(c[2], c[3]), f.axes[0]);
+  }
+});
+
 test('tesseract has 8 edges along each axis', () => {
   for (let a = 0; a < 4; a++) eq(tess.edges.filter((e) => e.axis === a).length, 8, `axis ${a}`);
 });
