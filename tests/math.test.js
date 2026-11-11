@@ -1,4 +1,4 @@
-import { makeBox, makeSimplex, makeCross, makeSphere, rotate, project, shadowRadius, sliceCrossings, sliceSegments, sliceFacets, orderPlanar } from '../src/math4d.js';
+import { makeBox, makeSimplex, makeCross, makeSphere, makeNet, unfoldVertices, rotate, project, shadowRadius, sliceCrossings, sliceSegments, sliceFacets, orderPlanar } from '../src/math4d.js';
 
 const results = [];
 function test(name, fn) {
@@ -177,6 +177,66 @@ test('every 3D solid slices to a closed loop', () => {
       eq(sliceFacets(s, c).length, 1, 'one filled polygon');
     }
   }
+});
+
+const solids = () => [
+  ['rectangle', makeBox([1, 0.5])], ['cube', cube], ['tesseract', tess],
+  ['triangle', makeSimplex(2)], ['tetrahedron', makeSimplex(3)], ['5-cell', makeSimplex(4)],
+  ['diamond', makeCross(2)], ['octahedron', makeCross(3)], ['16-cell', makeCross(4)],
+];
+
+test('nets: side counts (cube 6 squares, tesseract 8 cubes)', () => {
+  const sides = (s) => new Set(makeNet(s).copies.map((c) => c.side)).size;
+  eq(sides(makeBox([1, 0.5])), 4); eq(sides(cube), 6); eq(sides(tess), 8);
+  eq(sides(makeSimplex(4)), 5); eq(sides(makeCross(4)), 16);
+  eq(makeNet(tess).shape.edges.length, 96); eq(makeNet(tess).shape.faces.length, 48);
+  eq(makeNet(cube).shape.faces.length, 6);
+  eq(makeNet(makeSphere(3)), null);
+});
+
+test('nets: folded up, every corner is where the solid has it', () => {
+  for (const [name, s] of solids()) {
+    const net = makeNet(s);
+    unfoldVertices(s, net, 0).forEach((p, i) => {
+      p.forEach((x, k) => near(x, s.vertices[net.copies[i].v][k], name));
+    });
+  }
+});
+
+test('nets: laid out, everything lies flat in the being\'s world', () => {
+  for (const [name, s] of solids()) {
+    const net = makeNet(s);
+    unfoldVertices(s, net, 1).forEach((p) => near(p[s.dim - 1], 0, name));
+  }
+});
+
+test('nets: sides stay rigid while unfolding (edge lengths never change)', () => {
+  for (const [name, s] of solids()) {
+    const net = makeNet(s);
+    const len = (pts, e) => Math.hypot(...pts[e.a].map((x, i) => x - pts[e.b][i]));
+    const start = unfoldVertices(s, net, 0);
+    for (const t of [0.3, 0.7, 1]) {
+      const pts = unfoldVertices(s, net, t);
+      net.shape.edges.forEach((e) => near(len(pts, e), len(start, e), `${name} t=${t}`));
+    }
+  }
+});
+
+test('nets: hinged sides stay joined along their hinge', () => {
+  const net = makeNet(tess), pts = unfoldVertices(tess, net, 0.6);
+  let joined = 0;
+  net.copies.forEach((a, i) => net.copies.forEach((b, j) => {
+    if (i < j && a.v === b.v && (net.parent[a.side] === b.side || net.parent[b.side] === a.side)) {
+      pts[i].forEach((x, k) => near(x, pts[j][k], 'hinge corner'));
+      joined++;
+    }
+  }));
+  eq(joined, 7 * 4, 'seven hinges of four corners each');
+});
+
+test('pushed ball: shadow radius matches a projected edge-on point', () => {
+  const D = 3, R = 1.2, o = -0.9, L = D - o, h = o + R * R / L, rho = R * Math.sqrt(1 - R * R / (L * L));
+  near(shadowRadius(R, D, o), project([rho, 0, 0, h], D)[0]);
 });
 
 const failed = results.filter((r) => r.startsWith('FAIL')).length;

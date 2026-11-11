@@ -26,7 +26,7 @@ function finish(dim, vertices, edgePairs, faceCorners, cellVertexSets) {
     const set = new Set(list);
     const inside = [];
     edges.forEach((e, i) => { if (set.has(e.a) && set.has(e.b)) inside.push(i); });
-    return { edges: inside };
+    return { edges: inside, verts: list.slice() };
   });
   return { dim, vertices, edges, faces, cells };
 }
@@ -164,17 +164,141 @@ export function rotate(vertices, p, q, angle) {
  */
 export function project(v, distance = 0) {
   const last = v[v.length - 1];
-  const k = distance > 0 ? (distance - 1) / (distance - last) : 1;
+  // The floor of 1 stops anything pushed right up to the eye from blowing up to infinity.
+  const k = distance > 0 ? (distance - 1) / Math.max(distance - last, 1) : 1;
   const out = new Array(v.length - 1);
   for (let i = 0; i < out.length; i++) out[i] = v[i] * k;
   return out;
 }
 
-/** Radius of a ball's shadow under the same projection (its outline, seen from the eye). */
-export function shadowRadius(radius, distance = 0) {
+/**
+ * Radius of a ball's shadow under the same projection (its outline, seen from the eye).
+ * offset is how far the ball's centre has been pushed along the hidden axis.
+ */
+export function shadowRadius(radius, distance = 0, offset = 0) {
   if (!(distance > 0)) return radius;
-  const h = (radius * radius) / distance; // hidden coordinate of the ring the eye sees edge-on
-  return radius * Math.sqrt(1 - (radius * radius) / (distance * distance)) * (distance - 1) / (distance - h);
+  const away = distance - offset; // eye to the ball's centre
+  if (away <= radius) return radius * (distance - 1);
+  const h = offset + (radius * radius) / away; // hidden coordinate of the ring the eye sees edge-on
+  return radius * Math.sqrt(1 - (radius * radius) / (away * away)) * (distance - 1) / Math.max(distance - h, 1);
+}
+
+// ---------------------------------------------------------------- unfolding
+
+const dot = (a, b) => a.reduce((s, x, i) => s + x * b[i], 0);
+const sub = (a, b) => a.map((x, i) => x - b[i]);
+const unit = (a) => { const l = Math.hypot(...a); return l > 1e-12 ? a.map((x) => x / l) : null; };
+const centroid = (points) => points[0].map((_, i) => points.reduce((s, p) => s + p[i], 0) / points.length);
+
+/** Turn x in place about the point c, in the plane of e1 and e2, by `angle` (e1 towards e2). */
+function turn(x, c, e1, e2, angle) {
+  const d = sub(x, c);
+  const a = dot(d, e1), b = dot(d, e2);
+  const cs = Math.cos(angle), sn = Math.sin(angle);
+  const da = a * cs - b * sn - a, db = a * sn + b * cs - b;
+  for (let i = 0; i < x.length; i++) x[i] += da * e1[i] + db * e2[i];
+}
+
+/**
+ * Work out how to unfold a solid's skin flat, the way a cube opens into a cross of six squares.
+ * The skin is made of sides one dimension down from the solid (edges of a rectangle, faces of a
+ * cube, cubes of a tesseract). One side stays put; each of the others swings about the hinge it
+ * shares with a neighbour until it lies in the same flat space, which ends up being the
+ * being's own world. Returns null for round shapes, which cannot be flattened.
+ *
+ * The result holds `shape`, a drawable copy of the solid in which every side has its own
+ * corners (so sides can come apart), plus the hinge data unfoldVertices needs.
+ */
+export function makeNet(shape) {
+  if (shape.round) return null;
+  const n = shape.dim, V = shape.vertices;
+  const sides = n === 2 ? shape.edges.map((e) => [e.a, e.b])
+    : n === 3 ? shape.faces.map((f) => f.corners.slice())
+      : shape.cells.map((c) => c.verts.slice());
+  const centres = sides.map((s) => centroid(s.map((i) => V[i])));
+
+  // The side that stays put is the one facing most directly "down" the hidden axis.
+  let root = 0;
+  centres.forEach((c, i) => { if (c[n - 1] < centres[root][n - 1] - 1e-9) root = i; });
+
+  // Grow a tree of sides outward from the root; each new side hinges on one already placed.
+  const parent = new Array(sides.length).fill(-1);
+  const hinges = new Array(sides.length).fill(null);
+  const placed = new Set([root]), queue = [root];
+  while (queue.length) {
+    const f = queue.shift();
+    sides.forEach((list, g) => {
+      if (placed.has(g)) return;
+      const shared = list.filter((v) => sides[f].includes(v));
+      if (shared.length < n - 1) return;
+      const c = centroid(shared.map((i) => V[i]));
+      const u = unit(sub(c, centres[f]));   // out of the parent, across the hinge
+      const v = unit(sub(centres[g], c));   // into the child, from the hinge
+      const cos = Math.max(-1, Math.min(1, dot(u, v)));
+      const e2 = unit(u.map((x, i) => x - cos * v[i]));
+      hinges[g] = { c, e1: v, e2: e2 || v, angle: e2 ? Math.acos(cos) : 0 };
+      parent[g] = f;
+      placed.add(g);
+      queue.push(g);
+    });
+  }
+
+  // Finally tip the whole thing so the root side lies in the being's world, and lift it there.
+  const down = new Array(n).fill(0);
+  down[n - 1] = -1;
+  const normal = unit(centres[root]);
+  const cosA = Math.max(-1, Math.min(1, dot(normal, down)));
+  const tipTo = unit(down.map((x, i) => x - cosA * normal[i]));
+  const align = { e1: normal, e2: tipTo || normal, angle: tipTo ? Math.acos(cosA) : 0 };
+  const lift = Math.hypot(...centres[root]);
+
+  // The drawable copy: every side gets its own corners, edges and panes.
+  const copies = [], vmap = [];
+  sides.forEach((list, f) => {
+    vmap.push(new Map(list.map((v) => { copies.push({ side: f, v }); return [v, copies.length - 1]; })));
+  });
+  const edges = [], emap = [];
+  sides.forEach((list, f) => {
+    const m = new Map();
+    shape.edges.forEach((e, i) => {
+      if (!vmap[f].has(e.a) || !vmap[f].has(e.b)) return;
+      m.set(i, edges.length);
+      edges.push({ a: vmap[f].get(e.a), b: vmap[f].get(e.b), weights: e.weights, axis: e.axis });
+    });
+    emap.push(m);
+  });
+  const faces = [];
+  if (n >= 3) {
+    sides.forEach((list, f) => {
+      shape.faces.forEach((face, i) => {
+        if (n === 3 ? i !== f : !face.corners.every((v) => vmap[f].has(v))) return;
+        faces.push({ corners: face.corners.map((v) => vmap[f].get(v)), edges: face.edges.map((e) => emap[f].get(e)) });
+      });
+    });
+  }
+  const net = {
+    shape: { dim: n, vertices: copies.map((c) => V[c.v].slice()), edges, faces, cells: [] },
+    copies, root, parent, hinges, align, lift, fit: 1,
+  };
+  // How much the laid-out net must shrink to take up no more room than the solid did.
+  const reach = (pts) => Math.max(...pts.map((p) => Math.hypot(...p)));
+  net.fit = Math.min(1, (reach(V) * 1.2) / reach(unfoldVertices(shape, net, 1)));
+  return net;
+}
+
+/** Corner positions of the net's drawable shape, t = 0 (folded) to 1 (laid flat). */
+export function unfoldVertices(shape, net, t) {
+  const n = shape.dim, origin = new Array(n).fill(0);
+  return net.copies.map(({ side, v }) => {
+    const x = shape.vertices[v].slice();
+    for (let f = side; f !== net.root; f = net.parent[f]) {
+      const h = net.hinges[f];
+      turn(x, h.c, h.e1, h.e2, h.angle * t);
+    }
+    turn(x, origin, net.align.e1, net.align.e2, net.align.angle * t);
+    x[n - 1] += net.lift * t;
+    return x;
+  });
 }
 
 /**
