@@ -1,6 +1,44 @@
 // N-dimensional geometry core. No rendering dependencies, so it can be tested on its own.
 // Points are plain arrays of numbers; the *last* coordinate is always the "higher" axis
 // that the being cannot see (Y for the 1D being, Z for the 2D being, W for us).
+//
+// A shape is { dim, vertices, edges, faces, cells }:
+//   edges: { a, b, weights, axis }  weights say how much the edge runs along each axis (they
+//                                   sum to 1) and decide its colour; axis is the dominant one
+//   faces: { corners, edges }       a flat polygon: corners in order, and its boundary edges
+//   cells: { edges }                a 3D chunk of the surface, given by the edges it contains
+// Round shapes also carry { round: { radius } } and have no faces or cells.
+
+function finish(dim, vertices, edgePairs, faceCorners, cellVertexSets) {
+  const edges = edgePairs.map(([a, b]) => {
+    const d = vertices[b].map((x, i) => x - vertices[a][i]);
+    const len2 = d.reduce((s, x) => s + x * x, 0);
+    const weights = d.map((x) => (x * x) / len2);
+    return { a, b, weights, axis: weights.indexOf(Math.max(...weights)) };
+  });
+  const key = (a, b) => (a < b ? a * 65536 + b : b * 65536 + a);
+  const lookup = new Map(edges.map((e, i) => [key(e.a, e.b), i]));
+  const faces = faceCorners.map((corners) => ({
+    corners,
+    edges: corners.map((c, i) => lookup.get(key(c, corners[(i + 1) % corners.length]))),
+  }));
+  const cells = cellVertexSets.map((list) => {
+    const set = new Set(list);
+    const inside = [];
+    edges.forEach((e, i) => { if (set.has(e.a) && set.has(e.b)) inside.push(i); });
+    return { edges: inside };
+  });
+  return { dim, vertices, edges, faces, cells };
+}
+
+/** Every way of choosing k items from 0..n-1. */
+function combinations(n, k, start = 0, prefix = [], out = []) {
+  if (prefix.length === k) { out.push(prefix); return out; }
+  for (let i = start; i < n; i++) combinations(n, k, i + 1, [...prefix, i], out);
+  return out;
+}
+
+const range = (n) => Array.from({ length: n }, (_, i) => i);
 
 /** Axis-aligned box in n dimensions: rectangle (n=2), cuboid (n=3), tesseract (n=4). */
 export function makeBox(halfExtents) {
@@ -12,26 +50,99 @@ export function makeBox(halfExtents) {
     for (let a = 0; a < n; a++) v[a] = ((i >> a) & 1 ? 1 : -1) * halfExtents[a];
     vertices.push(v);
   }
-  // An edge joins two vertices that differ along exactly one axis; that axis gives its colour.
-  const edges = [];
+  // An edge joins two vertices that differ along exactly one axis.
+  const edgePairs = [];
   for (let i = 0; i < count; i++) {
-    for (let a = 0; a < n; a++) {
-      if (!((i >> a) & 1)) edges.push({ a: i, b: i | (1 << a), axis: a });
-    }
+    for (let a = 0; a < n; a++) if (!((i >> a) & 1)) edgePairs.push([i, i | (1 << a)]);
   }
-  // A 2D face spans two axes. Corners are listed going round the face: u runs along axes[0],
-  // v along axes[1]. A rectangle has 1, a cube 6, a tesseract 24.
-  const faces = [];
+  // A 2D face spans two axes. A rectangle has 1, a cube 6, a tesseract 24.
+  const faceCorners = [], faceAxes = [];
   for (let p = 0; p < n; p++) {
     for (let q = p + 1; q < n; q++) {
       const P = 1 << p, Q = 1 << q;
       for (let i = 0; i < count; i++) {
         if (i & (P | Q)) continue;
-        faces.push({ corners: [i, i | P, i | P | Q, i | Q], axes: [p, q] });
+        faceCorners.push([i, i | P, i | P | Q, i | Q]);
+        faceAxes.push([p, q]);
       }
     }
   }
-  return { dim: n, vertices, edges, faces };
+  // A tesseract's surface is 8 cubes: hold one coordinate at one end and vary the rest.
+  let cellSets = [];
+  if (n === 3) cellSets = [range(count)];
+  if (n === 4) {
+    for (let a = 0; a < n; a++) for (let s = 0; s < 2; s++) {
+      cellSets.push(range(count).filter((i) => ((i >> a) & 1) === s));
+    }
+  }
+  const shape = finish(n, vertices, edgePairs, faceCorners, cellSets);
+  shape.faces.forEach((f, i) => { f.axes = faceAxes[i]; });
+  return shape;
+}
+
+/**
+ * Regular simplex: triangle (n=2), 3-sided pyramid / tetrahedron (n=3), 5-cell (n=4).
+ * Built the way the ladder suggests: take the shape one dimension down and add a single new
+ * corner out along the new axis, so the edges up to that corner carry the new axis's colour.
+ */
+export function makeSimplex(n, radius = 1.35) {
+  let vertices = [[-0.5], [0.5]];
+  for (let k = 1; k < n; k++) {
+    const r2 = vertices[0].reduce((s, x) => s + x * x, 0);
+    const h = Math.sqrt(1 - r2), m = vertices.length;
+    vertices = vertices.map((v) => [...v, -h / (m + 1)]);
+    vertices.push([...new Array(k).fill(0), (h * m) / (m + 1)]);
+  }
+  const r = Math.hypot(...vertices[0]);
+  vertices = vertices.map((v) => v.map((x) => (x / r) * radius));
+  const count = n + 1;
+  const cells = n === 3 ? [range(count)] : n === 4 ? combinations(count, 4) : [];
+  return finish(n, vertices, combinations(count, 2), combinations(count, 3), cells);
+}
+
+/**
+ * Cross-polytope: one corner out along each direction of each axis.
+ * Diamond (n=2), octahedron (n=3), 16-cell (n=4). Vertex 2i is +axis i, vertex 2i+1 is -axis i.
+ */
+export function makeCross(n, radius = 1.4) {
+  const vertices = [];
+  for (let a = 0; a < n; a++) for (const s of [1, -1]) {
+    const v = new Array(n).fill(0);
+    v[a] = s * radius;
+    vertices.push(v);
+  }
+  const opposite = (a, b) => (a >> 1) === (b >> 1);
+  const edgePairs = combinations(2 * n, 2).filter(([a, b]) => !opposite(a, b));
+  const faces = n === 2
+    ? [[0, 2, 1, 3]]
+    : combinations(2 * n, 3).filter(([a, b, c]) => !opposite(a, b) && !opposite(a, c) && !opposite(b, c));
+  let cells = [];
+  if (n === 3) cells = [range(6)];
+  if (n === 4) for (let bits = 0; bits < 16; bits++) cells.push(range(4).map((a) => 2 * a + ((bits >> a) & 1)));
+  return finish(n, vertices, edgePairs, faces, cells);
+}
+
+/**
+ * Circle (n=2), sphere (n=3), hypersphere (n=4), drawn as one great circle in every pair of
+ * axes: 1, 3 and 6 of them. Each short piece of a circle is an edge, so its colour follows
+ * whichever way it happens to be heading at that point.
+ */
+export function makeSphere(n, radius = 1.2, segments = 48) {
+  const vertices = [], edgePairs = [];
+  for (let p = 0; p < n; p++) for (let q = p + 1; q < n; q++) {
+    const base = vertices.length;
+    for (let i = 0; i < segments; i++) {
+      const t = (i / segments) * Math.PI * 2;
+      const v = new Array(n).fill(0);
+      v[p] = radius * Math.cos(t);
+      v[q] = radius * Math.sin(t);
+      vertices.push(v);
+      edgePairs.push([base + i, base + ((i + 1) % segments)]);
+    }
+  }
+  const shape = finish(n, vertices, edgePairs, [], []);
+  shape.round = { radius, segments };
+  return shape;
 }
 
 /** Rotate every point by `angle` in the plane spanned by axes p and q (turning p towards q). */
@@ -59,6 +170,13 @@ export function project(v, distance = 0) {
   return out;
 }
 
+/** Radius of a ball's shadow under the same projection (its outline, seen from the eye). */
+export function shadowRadius(radius, distance = 0) {
+  if (!(distance > 0)) return radius;
+  const h = (radius * radius) / distance; // hidden coordinate of the ring the eye sees edge-on
+  return radius * Math.sqrt(1 - (radius * radius) / (distance * distance)) * (distance - 1) / (distance - h);
+}
+
 /**
  * Slice: where does each edge pierce the being's world (hidden coordinate = offset)?
  * The tiny default offset keeps the cut from landing exactly on a vertex.
@@ -78,41 +196,33 @@ export function sliceCrossings(shape, verts, offset = 1e-5) {
   return out;
 }
 
-function popcount(x) {
-  let c = 0;
-  while (x) { c += x & 1; x >>= 1; }
-  return c;
+function crossingByEdge(crossings) {
+  const map = new Map();
+  crossings.forEach((c, i) => map.set(c.edge, i));
+  return map;
 }
 
-/** Outline of the slice: two crossings are joined when their edges lie on the same 2D face. */
+/** Outline of the slice: a flat face that is cut gets cut along one line, joining two crossings. */
 export function sliceSegments(shape, crossings) {
+  const at = crossingByEdge(crossings);
   const out = [];
-  for (let i = 0; i < crossings.length; i++) {
-    const e1 = shape.edges[crossings[i].edge];
-    for (let j = i + 1; j < crossings.length; j++) {
-      const e2 = shape.edges[crossings[j].edge];
-      const mask = (e1.a ^ e1.b) | (e1.a ^ e2.a) | (e1.a ^ e2.b);
-      if (popcount(mask) <= 2) out.push([i, j]);
-    }
+  for (const face of shape.faces) {
+    const hit = face.edges.filter((e) => at.has(e)).map((e) => at.get(e));
+    if (hit.length === 2) out.push(hit);
   }
   return out;
 }
 
 /**
- * Faces of the slice: each (n-1)-dimensional cell of the box contributes the crossings on its
- * own edges. Returns arrays of crossing indices (unordered), only for cells cut in 3+ places.
+ * Faces of the slice: each cell contributes the crossings on its own edges.
+ * Returns arrays of crossing indices (unordered), only for cells cut in 3+ places.
  */
 export function sliceFacets(shape, crossings) {
+  const at = crossingByEdge(crossings);
   const out = [];
-  for (let axis = 0; axis < shape.dim; axis++) {
-    for (let sign = 0; sign < 2; sign++) {
-      const idx = [];
-      crossings.forEach((c, i) => {
-        const e = shape.edges[c.edge];
-        if (e.axis !== axis && ((e.a >> axis) & 1) === sign) idx.push(i);
-      });
-      if (idx.length >= 3) out.push(idx);
-    }
+  for (const cell of shape.cells) {
+    const hit = cell.edges.filter((e) => at.has(e)).map((e) => at.get(e));
+    if (hit.length >= 3) out.push(hit);
   }
   return out;
 }

@@ -1,4 +1,4 @@
-import { makeBox, rotate, project, sliceCrossings, sliceSegments, sliceFacets, orderPlanar } from '../src/math4d.js';
+import { makeBox, makeSimplex, makeCross, makeSphere, rotate, project, shadowRadius, sliceCrossings, sliceSegments, sliceFacets, orderPlanar } from '../src/math4d.js';
 
 const results = [];
 function test(name, fn) {
@@ -116,6 +116,67 @@ test('orderPlanar walks round a square', () => {
     near(Math.hypot(a[0] - b[0], a[1] - b[1]), 2, 'neighbours');
   }
   eq(orderPlanar([[0, 0, 0], [1, 0, 0], [2, 0, 0]]), null);
+});
+
+test('pyramid family: triangle, tetrahedron, 5-cell', () => {
+  const count = (s) => [s.vertices.length, s.edges.length, s.faces.length, s.cells.length].join(',');
+  eq(count(makeSimplex(2)), '3,3,1,0');
+  eq(count(makeSimplex(3)), '4,6,4,1');
+  eq(count(makeSimplex(4)), '5,10,10,5');
+  const s = makeSimplex(4);
+  const len = (e) => Math.hypot(...s.vertices[e.a].map((x, i) => x - s.vertices[e.b][i]));
+  s.edges.forEach((e) => near(len(e), len(s.edges[0]), 'all edges equal'));
+  s.vertices.forEach((v) => near(Math.hypot(...v), 1.35, 'centred'));
+});
+
+test('diamond family: diamond, octahedron, 16-cell', () => {
+  const count = (s) => [s.vertices.length, s.edges.length, s.faces.length, s.cells.length].join(',');
+  eq(count(makeCross(2)), '4,4,1,0');
+  eq(count(makeCross(3)), '6,12,8,1');
+  eq(count(makeCross(4)), '8,24,32,16');
+  makeCross(4).cells.forEach((c) => eq(c.edges.length, 6, 'each cell is a tetrahedron'));
+});
+
+test('edge colour weights sum to 1 and box edges are pure', () => {
+  for (const s of [tess, makeSimplex(4), makeCross(4), makeSphere(4)]) {
+    s.edges.forEach((e) => near(e.weights.reduce((a, b) => a + b, 0), 1));
+  }
+  tess.edges.forEach((e) => near(e.weights[e.axis], 1));
+});
+
+test('sphere family: 1, 3 and 6 great circles, all on the surface', () => {
+  eq(makeSphere(2).edges.length, 48); eq(makeSphere(3).edges.length, 144); eq(makeSphere(4).edges.length, 288);
+  rotate(makeSphere(4).vertices, 0, 3, 0.8).forEach((v) => near(Math.hypot(...v), 1.2));
+});
+
+test('ball shadow radius: unchanged when flat, matches a projected edge-on point', () => {
+  near(shadowRadius(1.2, 0), 1.2);
+  const D = 3, R = 1.2, h = R * R / D, rho = Math.sqrt(R * R - h * h);
+  near(shadowRadius(R, D), project([rho, 0, 0, h], D)[0]);
+});
+
+test('every 4D solid slices to a closed solid, at rest and turned', () => {
+  for (const [name, s] of [['5-cell', makeSimplex(4)], ['16-cell', makeCross(4)], ['tesseract', tess]]) {
+    for (const angle of [0, 0.3, 0.9, 1.7, 2.6, 4.1]) {
+      let v = rotate(s.vertices, 0, 3, angle);
+      v = rotate(v, 1, 3, angle * 0.37);
+      v = rotate(v, 2, 3, angle * 0.61);
+      const c = sliceCrossings(s, v);
+      const euler = c.length - sliceSegments(s, c).length + sliceFacets(s, c).length;
+      eq(euler, 2, `${name} at ${angle}`);
+    }
+  }
+});
+
+test('every 3D solid slices to a closed loop', () => {
+  for (const s of [makeSimplex(3), makeCross(3), cube]) {
+    for (const angle of [0, 0.4, 1.3, 2.9]) {
+      const v = rotate(rotate(s.vertices, 0, 2, angle), 1, 2, angle * 0.5);
+      const c = sliceCrossings(s, v);
+      eq(sliceSegments(s, c).length, c.length, 'loop');
+      eq(sliceFacets(s, c).length, 1, 'one filled polygon');
+    }
+  }
 });
 
 const failed = results.filter((r) => r.startsWith('FAIL')).length;

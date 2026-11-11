@@ -2,11 +2,11 @@ import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { VRButton } from 'three/addons/webxr/VRButton.js';
 import { XRControllerModelFactory } from 'three/addons/webxr/XRControllerModelFactory.js';
-import { makeBox, rotate, project, sliceCrossings, sliceSegments, sliceFacets, orderPlanar } from './math4d.js?v=4';
+import { makeBox, makeSimplex, makeCross, makeSphere, rotate, project, shadowRadius, sliceCrossings, sliceSegments, sliceFacets, orderPlanar } from './math4d.js?v=5';
 
 // Shown on the page and in the headset, so it is obvious which version is running.
 // Bump this (and the ?v= above when math4d.js changes) with every release.
-const BUILD = 'build 4';
+const BUILD = 'build 5';
 
 // ---------------------------------------------------------------- constants
 
@@ -47,21 +47,16 @@ const sun = new THREE.DirectionalLight(0xffffff, 1.5);
 sun.position.set(1, 3, 2);
 scene.add(sun);
 
-// The floor grid fades into fog, and a shell of stars gives the dark some depth.
-scene.fog = new THREE.Fog(0x0b0d12, 2.5, 10);
-scene.add(new THREE.GridHelper(40, 80, 0x34405a, 0x1c2334));
-{
-  const count = 1800, pos = new Float32Array(count * 3), p = new THREE.Vector3();
-  for (let i = 0; i < count; i++) {
-    p.randomDirection().multiplyScalar(22 + Math.random() * 18);
-    pos.set([p.x, p.y, p.z], i * 3);
-  }
-  const geo = new THREE.BufferGeometry();
-  geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
-  scene.add(new THREE.Points(geo, new THREE.PointsMaterial({
-    color: 0xa9bcff, size: 0.11, sizeAttenuation: true, transparent: true, opacity: 0.75, fog: false,
-  })));
-}
+// A solid floor with a grid drawn on it; both fade into the fog at the horizon.
+scene.fog = new THREE.Fog(0x0b0d12, 3, 14);
+const floor = new THREE.Mesh(
+  new THREE.CircleGeometry(30, 64),
+  new THREE.MeshStandardMaterial({ color: 0x1a2030, roughness: 0.95, metalness: 0 }));
+floor.rotation.x = -Math.PI / 2;
+scene.add(floor);
+const grid = new THREE.GridHelper(60, 120, 0x6477a6, 0x3b4868);
+grid.position.y = 0.003;
+scene.add(grid);
 
 // ---------------------------------------------------------------- drawing helpers
 
@@ -155,7 +150,6 @@ class Fill {
   }
 }
 
-const GLASS_N = 4; // each pane is drawn as a 4x4 grid so perspective shadows stay exact
 // How hazy one pane is: the fraction of the way to its full tint that it pushes whatever is
 // behind it. Panes combine as 1 - (1 - haze)^n, the way real layers of frosted glass do: two
 // panes are nearly twice as hazy as one, and a deep stack approaches the full tint without
@@ -171,42 +165,23 @@ const HAZE_BLEND = {
 };
 
 /**
- * Edge-lit glass. Each pane glows the colour of the edge it meets along that border and thins
- * to a faint mix in the middle. Blending is additive, so panes stack up without sorting and
- * overlapping glass gets brighter, which is what makes the layers readable.
+ * Glass panes. Each pane is one uniform layer of haze; only its tint varies, drifting from a
+ * mix in the middle towards the colour of whichever edge is nearest. Colours are written
+ * straight to the screen with no colour-space curve, so every pane has exactly the same
+ * strength wherever it sits in a stack.
  */
 const glassMaterial = new THREE.ShaderMaterial({
   vertexShader: /* glsl */`
-    attribute vec3 colorA;
-    attribute vec3 colorB;
-    varying vec2 vUv;
-    varying vec3 vA;
-    varying vec3 vB;
-    varying vec3 vN;
-    varying vec3 vP;
+    attribute vec3 tint;
+    varying vec3 vTint;
     void main() {
-      vUv = uv; vA = colorA; vB = colorB;
-      vN = normalMatrix * normal;
-      vec4 mv = modelViewMatrix * vec4(position, 1.0);
-      vP = mv.xyz;
-      gl_Position = projectionMatrix * mv;
+      vTint = tint;
+      gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
     }`,
   fragmentShader: /* glsl */`
-    varying vec2 vUv;
-    varying vec3 vA;
-    varying vec3 vB;
-    varying vec3 vN;
-    varying vec3 vP;
+    varying vec3 vTint;
     void main() {
-      float nearU = 1.0 - min(vUv.x, 1.0 - vUv.x) * 2.0; // 1 on the borders that run along axis B
-      float nearV = 1.0 - min(vUv.y, 1.0 - vUv.y) * 2.0; // 1 on the borders that run along axis A
-      // Only the tint drifts towards the nearest edge's colour; the amount of haze is the same
-      // everywhere on every pane, from every angle.
-      float towardsB = clamp(0.5 + 0.5 * (pow(nearU, 3.0) - pow(nearV, 3.0)), 0.0, 1.0);
-      vec3 tint = mix(vA, vB, towardsB);
-      // Written straight to the screen with no colour-space curve, so every pane is exactly
-      // the same strength wherever it sits in the stack.
-      gl_FragColor = vec4(tint * ${HAZE_PER_PANE.toFixed(3)}, 1.0);
+      gl_FragColor = vec4(vTint * ${HAZE_PER_PANE.toFixed(3)}, 1.0);
     }`,
   ...HAZE_BLEND,
   transparent: true,
@@ -214,39 +189,43 @@ const glassMaterial = new THREE.ShaderMaterial({
   side: THREE.DoubleSide,
 });
 
+/** A plain material that hazes by the same amount as one glass pane. `screen` is an on-screen colour. */
+function hazeMaterial(screen) {
+  return new THREE.MeshBasicMaterial({
+    color: screen.clone().multiplyScalar(HAZE_PER_PANE).convertSRGBToLinear(),
+    transparent: true, ...HAZE_BLEND, depthWrite: false, side: THREE.DoubleSide,
+  });
+}
+const ROUND_TINT = new THREE.Color().setRGB(0.66, 0.76, 0.95); // on-screen tint of a ball's skin
+
 class Glass {
-  constructor(shape) {
+  /** screenColors: one on-screen colour per edge of the shape. */
+  constructor(shape, screenColors) {
     this.shape = shape;
-    const N = GLASS_N, vertsPerFace = N * N * 6, total = shape.faces.length * vertsPerFace;
-    this.positions = new Float32Array(total * 3);
-    this.normals = new Float32Array(total * 3);
-    const uvs = new Float32Array(total * 2);
-    const colorA = new Float32Array(total * 3), colorB = new Float32Array(total * 3);
+    const triangles = shape.faces.reduce((n, f) => n + f.corners.length, 0);
+    this.positions = new Float32Array(triangles * 9);
+    const tints = new Float32Array(triangles * 9);
     let k = 0;
+    const put = (c) => { tints[k++] = c.r; tints[k++] = c.g; tints[k++] = c.b; };
+    const centre = new THREE.Color();
+    // Each face is a fan of triangles from its middle; every triangle owns one edge.
     for (const face of shape.faces) {
-      // Screen-space colour values, because the glass shader skips the colour-space curve.
-      const A = AXIS_COLORS[face.axes[0]].clone().convertLinearToSRGB();
-      const B = AXIS_COLORS[face.axes[1]].clone().convertLinearToSRGB();
-      for (let t = 0; t < N; t++) for (let s = 0; s < N; s++) {
-        for (const [ds, dt] of [[0, 0], [1, 0], [1, 1], [0, 0], [1, 1], [0, 1]]) {
-          uvs[k * 2] = (s + ds) / N; uvs[k * 2 + 1] = (t + dt) / N;
-          colorA.set([A.r, A.g, A.b], k * 3);
-          colorB.set([B.r, B.g, B.b], k * 3);
-          k++;
-        }
+      centre.setRGB(0, 0, 0);
+      for (const e of face.edges) {
+        centre.r += screenColors[e].r / face.edges.length;
+        centre.g += screenColors[e].g / face.edges.length;
+        centre.b += screenColors[e].b / face.edges.length;
       }
+      for (const e of face.edges) { put(centre); put(screenColors[e]); put(screenColors[e]); }
     }
-    const geo = new THREE.BufferGeometry();
+    this.geometry = new THREE.BufferGeometry();
     this.posAttr = new THREE.BufferAttribute(this.positions, 3).setUsage(THREE.DynamicDrawUsage);
-    this.normAttr = new THREE.BufferAttribute(this.normals, 3).setUsage(THREE.DynamicDrawUsage);
-    geo.setAttribute('position', this.posAttr);
-    geo.setAttribute('normal', this.normAttr);
-    geo.setAttribute('uv', new THREE.BufferAttribute(uvs, 2));
-    geo.setAttribute('colorA', new THREE.BufferAttribute(colorA, 3));
-    geo.setAttribute('colorB', new THREE.BufferAttribute(colorB, 3));
-    this.mesh = new THREE.Mesh(geo, glassMaterial);
+    this.geometry.setAttribute('position', this.posAttr);
+    this.geometry.setAttribute('tint', new THREE.BufferAttribute(tints, 3));
+    this.mesh = new THREE.Mesh(this.geometry, glassMaterial);
     this.mesh.frustumCulled = false;
-    this.grid = new Float32Array((N + 1) * (N + 1) * 3);
+    this.corner = new Float32Array(8 * 3);
+    this.mid = new Array(shape.dim).fill(0);
   }
 
   /**
@@ -255,44 +234,28 @@ class Glass {
    * distance along the hidden axis, or 0 for a flat shadow.
    */
   update(verts, coords, distance, scale) {
-    const N = GLASS_N, W = N + 1, dim = this.shape.dim, g = this.grid;
-    const pos = this.positions, nor = this.normals;
+    const dim = this.shape.dim, pos = this.positions, corner = this.corner, mid = this.mid;
+    const perspective = coords < dim && distance > 0;
     let o = 0;
     for (const face of this.shape.faces) {
-      const c0 = verts[face.corners[0]], c1 = verts[face.corners[1]];
-      const c2 = verts[face.corners[2]], c3 = verts[face.corners[3]];
-      for (let t = 0; t <= N; t++) for (let s = 0; s <= N; s++) {
-        const u = s / N, v = t / N;
-        const w0 = (1 - u) * (1 - v), w1 = u * (1 - v), w2 = u * v, w3 = (1 - u) * v;
-        let k = scale;
-        if (coords < dim && distance > 0) {
-          const hidden = c0[dim - 1] * w0 + c1[dim - 1] * w1 + c2[dim - 1] * w2 + c3[dim - 1] * w3;
-          k *= (distance - 1) / (distance - hidden);
-        }
-        const gi = (t * W + s) * 3;
-        for (let a = 0; a < 3; a++) {
-          g[gi + a] = a < coords ? (c0[a] * w0 + c1[a] * w1 + c2[a] * w2 + c3[a] * w3) * k : 0;
-        }
+      const n = face.corners.length;
+      mid.fill(0);
+      for (let i = 0; i < n; i++) {
+        const v = verts[face.corners[i]];
+        const k = perspective ? scale * (distance - 1) / (distance - v[dim - 1]) : scale;
+        for (let a = 0; a < 3; a++) corner[i * 3 + a] = a < coords ? v[a] * k : 0;
+        for (let a = 0; a < dim; a++) mid[a] += v[a] / n;
       }
-      // A projected pane is still flat, so one normal serves the whole face.
-      const i0 = 0, i1 = N * 3, i3 = N * W * 3;
-      const ax = g[i1] - g[i0], ay = g[i1 + 1] - g[i0 + 1], az = g[i1 + 2] - g[i0 + 2];
-      const bx = g[i3] - g[i0], by = g[i3 + 1] - g[i0 + 1], bz = g[i3 + 2] - g[i0 + 2];
-      let nx = ay * bz - az * by, ny = az * bx - ax * bz, nz = ax * by - ay * bx;
-      const nl = Math.hypot(nx, ny, nz);
-      if (nl > 1e-10) { nx /= nl; ny /= nl; nz /= nl; } else { nx = ny = nz = 0; }
-
-      for (let t = 0; t < N; t++) for (let s = 0; s < N; s++) {
-        const a = (t * W + s) * 3, b = a + 3, d = a + W * 3, c = d + 3;
-        for (const i of [a, b, c, a, c, d]) {
-          pos[o] = g[i]; pos[o + 1] = g[i + 1]; pos[o + 2] = g[i + 2];
-          nor[o] = nx; nor[o + 1] = ny; nor[o + 2] = nz;
-          o += 3;
-        }
+      const km = perspective ? scale * (distance - 1) / (distance - mid[dim - 1]) : scale;
+      const mx = mid[0] * km, my = coords > 1 ? mid[1] * km : 0, mz = coords > 2 ? mid[2] * km : 0;
+      for (let i = 0; i < n; i++) {
+        const a = i * 3, b = ((i + 1) % n) * 3;
+        pos[o++] = mx; pos[o++] = my; pos[o++] = mz;
+        pos[o++] = corner[a]; pos[o++] = corner[a + 1]; pos[o++] = corner[a + 2];
+        pos[o++] = corner[b]; pos[o++] = corner[b + 1]; pos[o++] = corner[b + 2];
       }
     }
     this.posAttr.needsUpdate = true;
-    this.normAttr.needsUpdate = true;
   }
 }
 
@@ -347,10 +310,34 @@ function makeLabel(lines, { height = 0.04, color = '#e8ecf4', bg = null, weight 
 // ---------------------------------------------------------------- stations
 
 const interactables = []; // meshes the mouse or a controller ray can hit
-const state = { mode: 0, autoSpin: true };
+const state = { mode: 0, autoSpin: true, family: 0 };
 const AXIS_WORDS = ['length', 'height', 'depth', '4th'];
 const WHITE = new THREE.Color(0xffffff);
 const _mix = new THREE.Color();
+
+// Each family is the "same" object at every rung of the ladder.
+const FAMILIES = [
+  {
+    label: 'Box',
+    make: (dim) => makeBox(dim === 2 ? [1, 0.5] : new Array(dim).fill(1)),
+    names: ['a rectangle', 'a cube', 'a tesseract (4D cube)'],
+  },
+  {
+    label: 'Pyramid',
+    make: (dim) => makeSimplex(dim),
+    names: ['a triangle', 'a regular tetrahedron', 'a 5-cell (4D tetrahedron)'],
+  },
+  {
+    label: 'Diamond',
+    make: (dim) => makeCross(dim),
+    names: ['a diamond', 'an octahedron', 'a 16-cell (4D octahedron)'],
+  },
+  {
+    label: 'Sphere',
+    make: (dim) => makeSphere(dim),
+    names: ['a circle', 'a sphere', 'a hypersphere (4D sphere)'],
+  },
+];
 
 function v3(arr, scale, target) {
   return target.set(arr[0] * scale, (arr[1] || 0) * scale, (arr[2] || 0) * scale);
@@ -412,12 +399,13 @@ class Knob {
 }
 
 class Station {
-  /** shape: the real object. Its last axis is the one this being cannot see. */
-  constructor({ title, subtitle, shape, objectName, viewCaption, knobsName, scale, viewY }) {
-    this.shape = shape;
+  /** dim: the dimension of the real object. Its last axis is the one this being cannot see. */
+  constructor({ dim, title, subtitle, viewCaption, knobsName, scale, viewY }) {
+    this.dim = dim;
     this.scale = scale;
+    this.shape = null;
+    this.dynamic = []; // per-shape drawables, rebuilt whenever the shape changes
     this.group = new THREE.Group();
-    const dim = shape.dim;
 
     const head = makeLabel([title], { height: 0.07 });
     head.position.set(0, 1.86, 0);
@@ -426,19 +414,15 @@ class Station {
     sub.position.set(0, 1.78, 0);
     this.group.add(sub);
 
+    this.objectCaption = makeLabel(['…'], { height: 0.028, color: '#aab4c5', weight: 500 });
+    this.objectCaption.position.set(0, dim < 4 ? 1.7 : 1.69, 0);
+    this.group.add(this.objectCaption);
+
     // The real object, shown only where we (3D beings) are able to see it.
     if (dim < 4) {
-      const cap = makeLabel([`Real object: ${objectName}`], { height: 0.028, color: '#aab4c5', weight: 500 });
-      cap.position.set(0, 1.7, 0);
-      this.group.add(cap);
-
       this.real = new THREE.Group();
       this.real.position.set(0, 1.53, 0);
       this.group.add(this.real);
-      this.realTubes = new Tubes(shape.edges.length, 0.0045);
-      this.realDots = new Dots(shape.vertices.length, 0.007);
-      this.realGlass = new Glass(shape);
-      this.real.add(this.realGlass.mesh, this.realTubes.mesh, this.realDots.mesh);
 
       // The being's world, drawn through the real object: a line for 1D, a sheet for 2D.
       if (dim === 2) {
@@ -456,13 +440,6 @@ class Station {
           new THREE.EdgesGeometry(sheet.geometry),
           new THREE.LineBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.4 })));
       }
-    } else {
-      const cap = makeLabel([
-        `Real object: ${objectName}`,
-        'You can’t see it. This is all a 3D being gets.',
-      ], { height: 0.028, color: '#aab4c5', weight: 500 });
-      cap.position.set(0, 1.69, 0);
-      this.group.add(cap);
     }
 
     // What the being sees.
@@ -480,21 +457,10 @@ class Station {
       backing.position.z = -0.012;
       this.view.add(backing);
     }
-    this.viewTubes = new Tubes(shape.edges.length, dim === 4 ? 0.0055 : 0.0045);
-    this.viewDots = new Dots(shape.edges.length, dim === 4 ? 0.012 : 0.01);
-    this.viewFill = new Fill(48);
-    this.view.add(this.viewFill.mesh, this.viewTubes.mesh, this.viewDots.mesh);
-    if (dim > 2) {
-      this.viewGlass = new Glass(shape);
-      this.view.add(this.viewGlass.mesh);
-    } else {
-      // On a line the pane's shadow is just the stretch it covers, so draw that as a band.
-      this.band = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), new THREE.MeshBasicMaterial({
-        color: _mix.copy(AXIS_COLORS[0]).convertLinearToSRGB()
-          .lerp(AXIS_COLORS[1].clone().convertLinearToSRGB(), 0.5)
-          .multiplyScalar(HAZE_PER_PANE).convertSRGBToLinear().clone(),
-        transparent: true, ...HAZE_BLEND, depthWrite: false,
-      }));
+    if (dim === 2) {
+      // On a line a pane's shadow is just the stretch it covers, so draw that as a band.
+      const tint = AXIS_COLORS[0].clone().convertLinearToSRGB().lerp(AXIS_COLORS[1].clone().convertLinearToSRGB(), 0.5);
+      this.band = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), hazeMaterial(tint));
       this.band.position.z = -0.006;
       this.view.add(this.band);
     }
@@ -512,9 +478,76 @@ class Station {
     this.group.add(klabel);
   }
 
+  /** Add a per-shape drawable, remembered so it can be thrown away on the next shape change. */
+  attach(parent, mesh) {
+    parent.add(mesh);
+    this.dynamic.push(mesh);
+    return mesh;
+  }
+
+  setShape(shape, objectName) {
+    for (const mesh of this.dynamic) {
+      mesh.parent.remove(mesh);
+      mesh.geometry.dispose();
+      if (mesh.material !== glassMaterial) mesh.material.dispose();
+      if (mesh.isInstancedMesh) mesh.dispose();
+    }
+    this.dynamic = [];
+    this.shape = shape;
+    const { dim, scale } = this;
+    const round = shape.round;
+
+    this.objectCaption.setText(dim < 4
+      ? [`Real object: ${objectName}`]
+      : [`Real object: ${objectName}`, 'You can’t see it. This is all a 3D being gets.']);
+
+    // An edge's colour is a blend of the axis colours, by how much it runs along each axis.
+    this.edgeColors = shape.edges.map((e) => {
+      const c = new THREE.Color(0, 0, 0);
+      e.weights.forEach((w, i) => { c.r += AXIS_COLORS[i].r * w; c.g += AXIS_COLORS[i].g * w; c.b += AXIS_COLORS[i].b * w; });
+      return c;
+    });
+    const screenColors = this.edgeColors.map((c) => c.clone().convertLinearToSRGB());
+    const thin = round ? 0.72 : 1; // the many short pieces of a circle read better drawn finer
+
+    this.realTubes = this.realDots = this.realGlass = null;
+    if (this.real) {
+      if (round) {
+        const skin = dim === 2
+          ? new THREE.CircleGeometry(round.radius * scale, 64)
+          : new THREE.SphereGeometry(round.radius * scale, 40, 24);
+        this.attach(this.real, new THREE.Mesh(skin, hazeMaterial(ROUND_TINT)));
+      } else {
+        this.realGlass = new Glass(shape, screenColors);
+        this.attach(this.real, this.realGlass.mesh);
+        this.realDots = new Dots(shape.vertices.length, 0.007);
+        this.attach(this.real, this.realDots.mesh);
+      }
+      this.realTubes = new Tubes(shape.edges.length, 0.0045 * thin);
+      this.attach(this.real, this.realTubes.mesh);
+    }
+
+    this.viewTubes = new Tubes(shape.edges.length + 1, (dim === 4 ? 0.0055 : 0.0045) * thin);
+    this.viewDots = new Dots(shape.edges.length + shape.vertices.length, dim === 4 ? 0.012 : 0.01);
+    this.viewFill = new Fill(64);
+    this.attach(this.view, this.viewFill.mesh);
+    this.attach(this.view, this.viewTubes.mesh);
+    this.attach(this.view, this.viewDots.mesh);
+
+    this.viewGlass = this.viewRound = null;
+    if (dim > 2 && round) {
+      // A ball's shadow, and its slice, is a smaller-dimensional ball: a disc for the 2D being, a ball for us.
+      const skin = dim === 3 ? new THREE.CircleGeometry(1, 64) : new THREE.SphereGeometry(1, 40, 24);
+      this.viewRound = this.attach(this.view, new THREE.Mesh(skin, hazeMaterial(ROUND_TINT)));
+    } else if (dim > 2) {
+      this.viewGlass = new Glass(shape, screenColors);
+      this.attach(this.view, this.viewGlass.mesh);
+    }
+  }
+
   update() {
-    const { shape, scale } = this;
-    const dim = shape.dim;
+    const { shape, scale, dim } = this;
+    const round = shape.round;
     const mode = MODES[state.mode].id;
     let verts = shape.vertices;
     for (const k of this.knobs) {
@@ -524,53 +557,60 @@ class Station {
 
     if (this.real) {
       this.realTubes.begin();
-      for (const e of shape.edges) {
-        this.realTubes.add(v3(verts[e.a], scale, _a), v3(verts[e.b], scale, _b), AXIS_COLORS[e.axis]);
-      }
+      shape.edges.forEach((e, i) => {
+        this.realTubes.add(v3(verts[e.a], scale, _a), v3(verts[e.b], scale, _b), this.edgeColors[i]);
+      });
       this.realTubes.end();
-      this.realDots.begin();
-      for (const v of verts) this.realDots.add(v3(v, scale, _a), WHITE);
-      this.realDots.end();
-      this.realGlass.update(verts, dim, 0, scale);
+      if (this.realDots) {
+        this.realDots.begin();
+        for (const v of verts) this.realDots.add(v3(v, scale, _a), WHITE);
+        this.realDots.end();
+      }
+      if (this.realGlass) this.realGlass.update(verts, dim, 0, scale);
     }
 
     this.viewTubes.begin();
     this.viewDots.begin();
     this.viewFill.begin();
     const slicing = mode === 'slice';
+    const d = mode === 'perspective' ? PERSPECTIVE_DISTANCE : 0;
     if (this.viewGlass) this.viewGlass.mesh.visible = !slicing;
     if (this.band) this.band.visible = !slicing;
+    if (this.viewRound) this.viewRound.scale.setScalar(scale * (slicing ? round.radius : shadowRadius(round.radius, d)));
 
     if (slicing) {
       const crossings = sliceCrossings(shape, verts);
       const pts = crossings.map((c) => v3(c.pos, scale, new THREE.Vector3()));
       // Each line of the slice is a glass pane cut through; it joins the two edges it runs between.
       for (const [i, j] of sliceSegments(shape, crossings)) {
-        _mix.copy(AXIS_COLORS[crossings[i].axis]).lerp(AXIS_COLORS[crossings[j].axis], 0.5).lerp(WHITE, 0.25);
+        _mix.copy(this.edgeColors[crossings[i].edge]).lerp(this.edgeColors[crossings[j].edge], 0.5).lerp(WHITE, 0.25);
         this.viewTubes.add(pts[i], pts[j], _mix, this.viewTubes.radius * 0.7);
       }
       // Each corner of the slice is where a coloured edge pokes through the being's world.
-      crossings.forEach((c, i) => this.viewDots.add(pts[i], AXIS_COLORS[c.axis]));
-
-      if (dim === 3) {
-        this.fillPolygon(pts, pts.map((_, i) => i));
-      } else if (dim === 4) {
-        for (const facet of sliceFacets(shape, crossings)) this.fillPolygon(pts, facet);
+      crossings.forEach((c, i) => this.viewDots.add(pts[i], this.edgeColors[c.edge]));
+      for (const facet of sliceFacets(shape, crossings)) this.fillPolygon(pts, facet);
+      // A circle has no flat panes to cut, so its slice is simply the stretch of line inside it.
+      if (round && dim === 2) {
+        this.viewTubes.add(_a.set(-round.radius * scale, 0, 0), _b.set(round.radius * scale, 0, 0), NEUTRAL, 0.003);
       }
     } else {
-      const d = mode === 'perspective' ? PERSPECTIVE_DISTANCE : 0;
       const shadow = verts.map((v) => v3(project(v, d), scale, new THREE.Vector3()));
+      const count = shape.edges.length;
       shape.edges.forEach((e, i) => {
         _a.copy(shadow[e.a]);
         _b.copy(shadow[e.b]);
         // On a line every edge lands on top of the others, so fan them out a few millimetres.
-        if (dim === 2) { const lane = (i - 1.5) * 0.014; _a.y += lane; _b.y += lane; }
-        this.viewTubes.add(_a, _b, AXIS_COLORS[e.axis]);
+        if (dim === 2) {
+          const lane = round ? (i < count / 2 ? -0.011 : 0.011) : (i - (count - 1) / 2) * 0.014;
+          _a.y += lane; _b.y += lane;
+        }
+        this.viewTubes.add(_a, _b, this.edgeColors[i]);
       });
-      if (this.viewGlass) {
+      if (dim > 2 && !round) {
         for (const p of shadow) this.viewDots.add(p, WHITE, this.viewDots.radius * 0.62);
-        this.viewGlass.update(verts, dim - 1, d, scale);
-      } else {
+      }
+      if (this.viewGlass) this.viewGlass.update(verts, dim - 1, d, scale);
+      if (this.band) {
         let lo = Infinity, hi = -Infinity;
         for (const p of shadow) { lo = Math.min(lo, p.x); hi = Math.max(hi, p.x); }
         this.band.position.x = (lo + hi) / 2;
@@ -591,19 +631,16 @@ class Station {
 
 const stations = [
   new Station({
-    title: '1D being', subtitle: 'lives on a line', shape: makeBox([1, 0.5]),
-    objectName: 'a rectangle', viewCaption: 'What the 1D being sees', knobsName: '2D knob',
-    scale: 0.11, viewY: 1.23,
+    dim: 2, title: '1D being', subtitle: 'lives on a line',
+    viewCaption: 'What the 1D being sees', knobsName: '2D knob', scale: 0.11, viewY: 1.23,
   }),
   new Station({
-    title: '2D being', subtitle: 'lives on a sheet', shape: makeBox([1, 1, 1]),
-    objectName: 'a cube', viewCaption: 'What the 2D being sees', knobsName: '3D knobs',
-    scale: 0.075, viewY: 1.15,
+    dim: 3, title: '2D being', subtitle: 'lives on a sheet',
+    viewCaption: 'What the 2D being sees', knobsName: '3D knobs', scale: 0.075, viewY: 1.15,
   }),
   new Station({
-    title: 'You', subtitle: 'live in a 3D space', shape: makeBox([1, 1, 1, 1]),
-    objectName: 'a tesseract (4D cube)', viewCaption: 'What you see', knobsName: '4D knobs',
-    scale: 0.115, viewY: 1.29,
+    dim: 4, title: 'You', subtitle: 'live in a 3D space',
+    viewCaption: 'What you see', knobsName: '4D knobs', scale: 0.115, viewY: 1.29,
   }),
 ];
 const knobs = stations.flatMap((s) => s.knobs);
@@ -635,7 +672,7 @@ scene.add(panel);
 
 function makeButton(x, onClick) {
   const mesh = new THREE.Mesh(
-    new THREE.BoxGeometry(0.27, 0.07, 0.02),
+    new THREE.BoxGeometry(0.25, 0.07, 0.02),
     new THREE.MeshStandardMaterial({ color: 0x27304a, roughness: 0.6 }));
   mesh.position.set(x, 0, 0);
   mesh.userData = { kind: 'button', onClick };
@@ -648,9 +685,10 @@ function makeButton(x, onClick) {
   return mesh;
 }
 
-const modeButton = makeButton(-0.29, () => setMode((state.mode + 1) % MODES.length));
-const spinButton = makeButton(0, () => setAutoSpin(!state.autoSpin));
-const resetButton = makeButton(0.29, () => resetKnobs());
+const shapeButton = makeButton(-0.405, () => setFamily((state.family + 1) % FAMILIES.length));
+const modeButton = makeButton(-0.135, () => setMode((state.mode + 1) % MODES.length));
+const spinButton = makeButton(0.135, () => setAutoSpin(!state.autoSpin));
+const resetButton = makeButton(0.405, () => resetKnobs());
 resetButton.label.setText(['Reset knobs']);
 const blurb = makeLabel(['…'], { height: 0.024, color: '#aab4c5', weight: 500 });
 blurb.position.set(0, 0.075, 0);
@@ -660,6 +698,12 @@ function setMode(i) {
   state.mode = i;
   modeButton.label.setText([`View: ${MODES[i].name}`]);
   blurb.setText([MODES[i].blurb]);
+}
+/** Swap the object at every station for the same kind of shape in that station's dimension. */
+function setFamily(i) {
+  state.family = i;
+  stations.forEach((s, k) => s.setShape(FAMILIES[i].make(s.dim), FAMILIES[i].names[k]));
+  shapeButton.label.setText([`Shape: ${FAMILIES[i].label}`]);
 }
 function setAutoSpin(on) {
   state.autoSpin = on;
@@ -675,6 +719,7 @@ function resetKnobs() {
   for (const k of knobs) k.angle = 0;
   setAutoSpin(false);
 }
+setFamily(0);
 setMode(0);
 setAutoSpin(true);
 
@@ -723,6 +768,7 @@ renderer.domElement.addEventListener('pointercancel', endDrag);
 window.addEventListener('keydown', (event) => {
   if (event.code === 'KeyM') setMode((state.mode + 1) % MODES.length);
   if (event.code === 'KeyR') resetKnobs();
+  if (event.code === 'KeyS') setFamily((state.family + 1) % FAMILIES.length);
   if (event.code === 'Space') { setAutoSpin(!state.autoSpin); event.preventDefault(); }
 });
 
@@ -841,10 +887,10 @@ function updateControllers(dt) {
       knob.angle += stick * dt * 1.6;
       knob.nudged = true;
     }
-    // A / X cycles the view, B / Y toggles auto-spin.
+    // A / X cycles the view, B / Y cycles the shape.
     const pressed = (n) => !!pad.buttons[n]?.pressed;
     if (pressed(4) && !data.buttons[4]) setMode((state.mode + 1) % MODES.length);
-    if (pressed(5) && !data.buttons[5]) setAutoSpin(!state.autoSpin);
+    if (pressed(5) && !data.buttons[5]) setFamily((state.family + 1) % FAMILIES.length);
     data.buttons[4] = pressed(4);
     data.buttons[5] = pressed(5);
   }
@@ -875,4 +921,4 @@ renderer.setAnimationLoop(() => {
 });
 
 // Handy for poking at things from the browser console.
-window.app = { stations, knobs, state, setMode, setAutoSpin, resetKnobs, MODES };
+window.app = { stations, knobs, state, setMode, setFamily, setAutoSpin, resetKnobs, MODES, FAMILIES };
